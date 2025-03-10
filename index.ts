@@ -1,10 +1,11 @@
-import cors from '@fastify/cors';
-import { WebSocket } from '@fastify/websocket';
-import spawn from 'child_process';
-import fastify, { FastifyReply, FastifyRequest } from 'fastify';
-import isValidDomain from 'is-valid-domain';
-import { isIP } from 'net';
-import { z } from "zod";
+import cors from '@fastify/cors'
+import { WebSocket } from '@fastify/websocket'
+import spawn from 'child_process'
+import fastify, { FastifyReply, FastifyRequest } from 'fastify'
+import isValidDomain from 'is-valid-domain'
+import { isIP } from 'net'
+import { promises as dns } from 'dns'
+import { z } from "zod"
 
 const server = fastify()
 server.register(cors, {
@@ -27,31 +28,24 @@ const validateSubnet = (subnet: string) => {
         return false
     }
     if (ipVersion === 4) {
-        if (cidr < 0 || cidr > 32) {
-            return false
-        }
-        return true
+        return false
     }
     if (ipVersion === 6) {
-        if (cidr < 0 || cidr > 128) {
-            return false
-        }
-        return true
+        return cidr >= 0 && cidr <= 128
     }
     return false
 }
 
 server.get('/', async (request: FastifyRequest, reply: FastifyReply) => {
-    return reply.status(200).send({ "message": "https://github.com/KittensAreDaBest/caramel" })
+    return reply.status(200).send({ "message": "https://github.com/vojkovic/confetti" })
 })
 
 server.register(async function (fastify) {
-    fastify.get('/latency', {websocket: true}, async (connection: WebSocket, request: FastifyRequest) => {
-        const remoteIp = request.headers['x-forwarded-for'] || request.socket.remoteAddress;
+    fastify.get('/latency', { websocket: true }, async (connection: WebSocket, request: FastifyRequest) => {
+        const remoteIp = request.headers['x-forwarded-for'] || request.socket.remoteAddress
         console.log(`[${new Date()}][LATENCY] websocket connected from ${remoteIp}`)
         connection.on('message', (message: string) => {
-            // message as string and send it back
-            connection.send(message.toString());
+            connection.send(message.toString())
         })
         connection.on('close', () => {
             console.log(`[${new Date()}][LATENCY] websocket disconnected from ${remoteIp}`)
@@ -71,49 +65,83 @@ server.post('/lg', async (request: FastifyRequest, reply: FastifyReply) => {
     }
     const remoteIp = request.headers['x-forwarded-for'] || request.socket.remoteAddress
     console.log(`[${new Date()}][LG] ${validation.type} ${validation.target} from ${remoteIp}`)
+
+    const checkIPv6 = async (target: string): Promise<string | null> => {
+        if (isIP(target) === 4) {
+            return "IPv4 addresses are not allowed. Please provide an IPv6 address."
+        }
+        if (!isIP(target)) {
+            try {
+                const aaaaRecords = await dns.resolve6(target)
+                if (!aaaaRecords || aaaaRecords.length === 0) {
+                    return "The provided domain only resolves to IPv4 (A record). Please use a domain with an AAAA record for IPv6."
+                }
+            } catch (err) {
+                return "Failed to resolve AAAA record for the domain. Ensure the domain has a valid IPv6 address."
+            }
+        }
+        return null
+    }
+
     switch (validation.type) {
         case "mtr":
             if (!(process.env.PINGTRACE_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "MTR is disabled" });
+                return reply.status(400).send({ "error": "MTR is disabled" })
             }
-            if (!isIP(validation.target) && !isValidDomain(validation.target)) {
-                return reply.status(400).send({ "error": "Invalid IP/Domain" });
+            {
+                const error = await checkIPv6(validation.target)
+                if (error) {
+                    return reply.status(400).send({ "error": error })
+                }
+                const mtr = spawn.spawnSync('mtr', ['-c', '5', '-r', '-w', '-b', validation.target])
+                const output = mtr.stdout.toString() || mtr.stderr.toString()
+                return reply.status(200).send({ "data": output })
             }
-            const mtr = spawn.spawnSync('mtr', ['-c', '5', '-r', '-w', '-b', validation.target]);
-            return reply.status(200).send({ "data": mtr.stdout.toString().length > 0 ? mtr.stdout.toString() : mtr.stderr.toString() });
 
         case "traceroute":
             if (!(process.env.PINGTRACE_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "Traceroute is disabled" });
+                return reply.status(400).send({ "error": "Traceroute is disabled" })
             }
-            if (!isIP(validation.target) && !isValidDomain(validation.target)) {
-                return reply.status(400).send({ "error": "Invalid IP/Domain" });
+            {
+                const error = await checkIPv6(validation.target)
+                if (error) {
+                    return reply.status(400).send({ "error": error })
+                }
+                const traceroute = spawn.spawnSync('traceroute', ['-w', '1', '-q', '1', validation.target])
+                const output = traceroute.stdout.toString() || traceroute.stderr.toString()
+                return reply.status(200).send({ "data": output })
             }
-            const traceroute = spawn.spawnSync('traceroute', ['-w', '1', '-q', '1', validation.target]);
-            return reply.status(200).send({ "data": traceroute.stdout.toString().length > 0 ? traceroute.stdout.toString() : traceroute.stderr.toString() });
 
         case "ping":
             if (!(process.env.PINGTRACE_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "Ping is disabled" });
+                return reply.status(400).send({ "error": "Ping is disabled" })
             }
-            if (!isIP(validation.target) && !isValidDomain(validation.target)) {
-                return reply.status(400).send({ "error": "Invalid IP/Domain" });
+            {
+                const error = await checkIPv6(validation.target)
+                if (error) {
+                    return reply.status(400).send({ "error": error })
+                }
+                // Spawn the ping command.
+                const ping = spawn.spawnSync('ping', ['-c', '5', validation.target])
+                const output = ping.stdout.toString() || ping.stderr.toString()
+                return reply.status(200).send({ "data": output })
             }
-            const ping = spawn.spawnSync('ping', ['-c', '5', validation.target]);
-            return reply.status(200).send({ "data": ping.stdout.toString().length > 0 ? ping.stdout.toString() : ping.stderr.toString() });
 
         case "bgp":
             if (!(process.env.BGP_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "BGP is disabled" });
+                return reply.status(400).send({ "error": "BGP is disabled" })
             }
             if (!isIP(validation.target) && !validateSubnet(validation.target)) {
-                return reply.status(400).send({ "error": "Invalid IP/CIDR" });
+                return reply.status(400).send({ "error": "Invalid IP/CIDR. Ensure it is in IPv6 format with a valid CIDR." })
             }
-            const bgp = spawn.spawnSync('birdc', ['-r', 'sh', 'ro', 'all', 'for', validation.target]);
-            return reply.status(200).send({ "data": bgp.stdout.toString().length > 0 ? bgp.stdout.toString() : bgp.stderr.toString() });
+            const bgp = spawn.spawnSync('birdc', ['-r', 'sh', 'ro', 'all', 'for', validation.target])
+            {
+                const output = bgp.stdout.toString() || bgp.stderr.toString()
+                return reply.status(200).send({ "data": output })
+            }
 
         default:
-            return reply.status(400).send({ "error": "Invalid type" });
+            return reply.status(400).send({ "error": "Invalid type" })
     }
 })
 

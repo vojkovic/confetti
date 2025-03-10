@@ -1,17 +1,13 @@
-version: '3.7'
-
 services:
-  app:
+  confetti:
     build: 
       context: .
       dockerfile: Dockerfile
     restart: always
-    hostname: looking-glass
-    user: "0:0" # if not using bird can remove
-    network_mode: host # ipv6 support due to docker networking
-    volumes:
-      - /run/bird/bird.ctl:/var/run/bird.ctl # if not using bird can remove
+    hostname: confetti
+    ports:
+      - "8080:33046"
     environment:
-      - CORS_ORIGIN=https://lg.example.com # set to your domain
+      - CORS_ORIGIN=http://127.0.0.1 # set to your domain
       - BGP_ENABLED=true # allow bgp queryies
       - PINGTRACE_ENABLED=false # allow ping/trace/mtr
