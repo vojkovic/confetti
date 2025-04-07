@@ -145,7 +145,7 @@ server.post('/lg', async (request: FastifyRequest, reply: FastifyReply) => {
     }
 })
 
-server.listen({ port: 33046, host: "0.0.0.0" }, (err: any, address: string) => {
+server.listen({ port: 33046, host: "::1" }, (err: any, address: string) => {
     if (err) {
         console.error(err)
         process.exit(1)
