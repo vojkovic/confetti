@@ -166,10 +166,6 @@ server.post('/lg', async (request: FastifyRequest, reply: FastifyReply) => {
     const remoteIp = request.headers['x-forwarded-for'] || request.socket.remoteAddress
     console.log(`[${new Date()}][LG] ${type} ${target} from ${remoteIp}`)
 
-    if (type === 'bgp' && !target.includes('/')) {
-        return reply.status(400).send({ error: "BGP queries require CIDR notation" })
-    }
-
     const error = await validateIPv6Target(target)
     if (error) {
         return reply.status(403).send({ error })
