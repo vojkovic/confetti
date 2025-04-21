@@ -2,10 +2,127 @@ import cors from '@fastify/cors'
 import { WebSocket } from '@fastify/websocket'
 import spawn from 'child_process'
 import fastify, { FastifyReply, FastifyRequest } from 'fastify'
-import isValidDomain from 'is-valid-domain'
 import { isIP } from 'net'
 import { promises as dns } from 'dns'
 import { z } from "zod"
+import ipaddr from 'ipaddr.js'
+
+type NetworkToolType = 'mtr' | 'traceroute' | 'ping' | 'bgp'
+
+interface NetworkToolConfig {
+    command: string
+    args: (target: string) => string[]
+    enabled: boolean
+}
+
+const NETWORK_TOOLS: Record<NetworkToolType, NetworkToolConfig> = {
+    mtr: {
+        command: 'mtr',
+        args: (target) => ['-c', '5', '-r', '-w', '-b', target],
+        enabled: process.env.PINGTRACE_ENABLED === 'true'
+    },
+    traceroute: {
+        command: 'traceroute',
+        args: (target) => ['-w', '1', '-q', '1', target],
+        enabled: process.env.PINGTRACE_ENABLED === 'true'
+    },
+    ping: {
+        command: 'ping',
+        args: (target) => ['-c', '5', target],
+        enabled: process.env.PINGTRACE_ENABLED === 'true'
+    },
+    bgp: {
+        command: 'birdc',
+        args: (target) => ['-r', 'sh', 'ro', 'all', 'for', target],
+        enabled: process.env.BGP_ENABLED === 'true'
+    }
+}
+
+const BOGON_PREFIXES = [
+    '::/8',
+    '64:ff9b::/96',
+    '100::/8',
+    '200::/7',
+    '400::/6',
+    '800::/5',
+    '1000::/4',
+    '2001::/33',
+    '2001:0:8000::/33',
+    '2001:2::/48',
+    '2001:3::/32',
+    '2001:10::/28',
+    '2001:20::/28',
+    '2001:db8::/32',
+    '2002::/16',
+    '3ffe::/16',
+    '4000::/3',
+    '5f00::/8',
+    '6000::/3',
+    '8000::/3',
+    'a000::/3',
+    'c000::/3',
+    'e000::/4',
+    'f000::/5',
+    'f800::/6',
+    'fc00::/7',
+    'fe80::/10',
+    'fec0::/10',
+    'ff00::/8'
+].map(prefix => {
+    const [addr, len] = prefix.split('/')
+    return { prefix: ipaddr.IPv6.parse(addr), length: parseInt(len) }
+})
+
+const isBogonPrefix = (target: string): boolean => {
+    try {
+        const [addr, len] = target.split('/')
+        const parsed = ipaddr.IPv6.parse(addr)
+        const prefixLen = len ? parseInt(len) : 128
+
+        return BOGON_PREFIXES.some(bogon => {
+            if (prefixLen < bogon.length) return false
+            const targetPrefix = parsed.match(bogon.prefix, bogon.length)
+            return targetPrefix
+        })
+    } catch {
+        return true
+    }
+}
+
+const validateIPv6Target = async (target: string): Promise<string | null> => {
+    if (isIP(target.split('/')[0]) === 4) {
+        return "IPv4 addresses are not allowed. Please provide an IPv6 address."
+    }
+
+    if (!isIP(target.split('/')[0])) {
+        try {
+            const records = await dns.resolve6(target)
+            if (!records?.length) {
+                return "The provided domain only resolves to IPv4 (A record). Please use a domain with an AAAA record for IPv6."
+            }
+            target = records[0]
+        } catch {
+            return "Failed to resolve AAAA record for the domain. Ensure the domain has a valid IPv6 address."
+        }
+    }
+
+    if (isBogonPrefix(target)) {
+        return "Bogon prefix detected. Queries for bogon prefixes are not allowed."
+    }
+
+    return null
+}
+
+const executeNetworkTool = (type: NetworkToolType, target: string): { data?: string, error?: string } => {
+    const tool = NETWORK_TOOLS[type]
+    if (!tool.enabled) {
+        return { error: `${type.toUpperCase()} is disabled` }
+    }
+
+    const result = spawn.spawnSync(tool.command, tool.args(target))
+    const output = result.stdout?.toString() || result.stderr?.toString()
+    return { data: output }
+}
 
 const server = fastify()
 server.register(cors, {
@@ -16,25 +133,6 @@ server.register(import('@fastify/rate-limit'), {
     max: 30,
     timeWindow: '1 minute'
 })
-
-const validateSubnet = (subnet: string) => {
-    const ip = subnet.split('/')[0]
-    const ipVersion = isIP(ip)
-    const cidr = subnet.split('/')[1] as unknown as number
-    if (isNaN(cidr)) {
-        return false
-    }
-    if (subnet.split('/').length !== 2) {
-        return false
-    }
-    if (ipVersion === 4) {
-        return false
-    }
-    if (ipVersion === 6) {
-        return cidr >= 0 && cidr <= 128
-    }
-    return false
-}
 
 server.get('/', async (request: FastifyRequest, reply: FastifyReply) => {
     return reply.status(200).send({ "message": "https://github.com/vojkovic/confetti" })
@@ -53,96 +151,36 @@ server.register(async function (fastify) {
     })
 })
 
+const requestSchema = z.object({
+    type: z.enum(['mtr', 'traceroute', 'ping', 'bgp']),
+    target: z.string().trim()
+})
+
 server.post('/lg', async (request: FastifyRequest, reply: FastifyReply) => {
-    let validation
-    try {
-        validation = z.object({
-            type: z.enum(["mtr", "traceroute", "ping", "bgp"]),
-            target: z.string().trim(),
-        }).parse(request.body)
-    } catch (err) {
-        return reply.status(400).send({ "error": err })
+    const validation = requestSchema.safeParse(request.body)
+    if (!validation.success) {
+        return reply.status(400).send({ error: validation.error })
     }
+
+    const { type, target } = validation.data
     const remoteIp = request.headers['x-forwarded-for'] || request.socket.remoteAddress
-    console.log(`[${new Date()}][LG] ${validation.type} ${validation.target} from ${remoteIp}`)
+    console.log(`[${new Date()}][LG] ${type} ${target} from ${remoteIp}`)
 
-    const checkIPv6 = async (target: string): Promise<string | null> => {
-        if (isIP(target) === 4) {
-            return "IPv4 addresses are not allowed. Please provide an IPv6 address."
-        }
-        if (!isIP(target)) {
-            try {
-                const aaaaRecords = await dns.resolve6(target)
-                if (!aaaaRecords || aaaaRecords.length === 0) {
-                    return "The provided domain only resolves to IPv4 (A record). Please use a domain with an AAAA record for IPv6."
-                }
-            } catch (err) {
-                return "Failed to resolve AAAA record for the domain. Ensure the domain has a valid IPv6 address."
-            }
-        }
-        return null
+    if (type === 'bgp' && !target.includes('/')) {
+        return reply.status(400).send({ error: "BGP queries require CIDR notation" })
     }
 
-    switch (validation.type) {
-        case "mtr":
-            if (!(process.env.PINGTRACE_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "MTR is disabled" })
-            }
-            {
-                const error = await checkIPv6(validation.target)
-                if (error) {
-                    return reply.status(400).send({ "error": error })
-                }
-                const mtr = spawn.spawnSync('mtr', ['-c', '5', '-r', '-w', '-b', validation.target])
-                const output = mtr.stdout.toString() || mtr.stderr.toString()
-                return reply.status(200).send({ "data": output })
-            }
-
-        case "traceroute":
-            if (!(process.env.PINGTRACE_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "Traceroute is disabled" })
-            }
-            {
-                const error = await checkIPv6(validation.target)
-                if (error) {
-                    return reply.status(400).send({ "error": error })
-                }
-                const traceroute = spawn.spawnSync('traceroute', ['-w', '1', '-q', '1', validation.target])
-                const output = traceroute.stdout.toString() || traceroute.stderr.toString()
-                return reply.status(200).send({ "data": output })
-            }
-
-        case "ping":
-            if (!(process.env.PINGTRACE_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "Ping is disabled" })
-            }
-            {
-                const error = await checkIPv6(validation.target)
-                if (error) {
-                    return reply.status(400).send({ "error": error })
-                }
-                // Spawn the ping command.
-                const ping = spawn.spawnSync('ping', ['-c', '5', validation.target])
-                const output = ping.stdout.toString() || ping.stderr.toString()
-                return reply.status(200).send({ "data": output })
-            }
-
-        case "bgp":
-            if (!(process.env.BGP_ENABLED === "true")) {
-                return reply.status(400).send({ "error": "BGP is disabled" })
-            }
-            if (!isIP(validation.target) && !validateSubnet(validation.target)) {
-                return reply.status(400).send({ "error": "Invalid IP/CIDR. Ensure it is in IPv6 format with a valid CIDR." })
-            }
-            const bgp = spawn.spawnSync('birdc', ['-r', 'sh', 'ro', 'all', 'for', validation.target])
-            {
-                const output = bgp.stdout.toString() || bgp.stderr.toString()
-                return reply.status(200).send({ "data": output })
-            }
-
-        default:
-            return reply.status(400).send({ "error": "Invalid type" })
+    const error = await validateIPv6Target(target)
+    if (error) {
+        return reply.status(403).send({ error })
     }
+
+    const result = executeNetworkTool(type, target)
+    if (result.error) {
+        return reply.status(400).send({ error: result.error })
+    }
+
+    return reply.status(200).send({ data: result.data })
 })
 
 server.listen({ port: 33046, host: "::1" }, (err: any, address: string) => {
